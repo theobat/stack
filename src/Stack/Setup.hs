@@ -1785,13 +1785,17 @@ getUtf8EnvVars compilerVer =
 
 -- Binary Stack upgrades
 
-newtype StackReleaseInfo = StackReleaseInfo Value
+data StackReleaseInfo
+  = SRIGithub !Value
+  | SRIHaskellStackOrg
 
 downloadStackReleaseInfo :: (MonadIO m, MonadThrow m)
                          => Maybe String -- Github org
                          -> Maybe String -- Github repo
                          -> Maybe String -- ^ optional version
                          -> m StackReleaseInfo
+downloadStackReleaseInfo Nothing Nothing Nothing = pure $ SRIHaskellStackOrg
+    error "https://get.haskellstack.org/upgrade/linux-x86_64.tar.gz"
 downloadStackReleaseInfo morg mrepo mver = liftIO $ do
     let org = fromMaybe "commercialhaskell" morg
         repo = fromMaybe "stack" mrepo
@@ -1933,25 +1937,26 @@ downloadStackExe platforms0 archiveInfo destDir checkPath testExe = do
                     , T.unpack url
                     ]
                 loop (Tar.Fail e) = throwM e
-                loop (Tar.Next e es)
-                    | Tar.entryPath e == exeName =
-                        case Tar.entryContent e of
-                            Tar.NormalFile lbs _ -> do
-                              ensureDir destDir
-                              LBS.writeFile (toFilePath tmpFile) lbs
-                            _ -> error $ concat
-                                [ "Invalid file type for tar entry named "
-                                , exeName
-                                , " downloaded from "
-                                , T.unpack url
-                                ]
-                    | otherwise = loop es
+                loop (Tar.Next e es) =
+                    case splitPath (Tar.entryPath e) of
+                        -- Ignore the first component, see: https://github.com/commercialhaskell/stack/issues/5288
+                        [_ignored, name] | name == exeName = do
+                            case Tar.entryContent e of
+                                Tar.NormalFile lbs _ -> do
+                                  ensureDir destDir
+                                  LBS.writeFile (toFilePath tmpFile) lbs
+                                _ -> error $ concat
+                                    [ "Invalid file type for tar entry named "
+                                    , Tar.entryPath e
+                                    , " downloaded from "
+                                    , T.unpack url
+                                    ]
+                        _ = loop es
             loop entries
       where
-        -- The takeBaseName drops the .gz, dropExtension drops the .tar
-        exeName =
-            let base = FP.dropExtension (FP.takeBaseName (T.unpack url)) FP.</> "stack"
-             in if isWindows then base FP.<.> "exe" else base
+        exeName
+          | isWindows = "stack.exe"
+          | otherwise = "stack"
 
 -- | Ensure that the Stack executable download is in the same location
 -- as the currently running executable. See:
