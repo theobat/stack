@@ -1,0 +1,24 @@
+cabal-version: 1.12
+
+-- This file has been generated from package.yaml by hpack version 0.33.0.
+--
+-- see: https://github.com/sol/hpack
+--
+-- hash: 3d7de7dda20739c8820a7edc246a66550f868bd67e01a8b8513844614acf2b98
+
+name:           main-aaa-lib
+version:        1
+build-type:     Simple
+
+library
+  exposed-modules:
+      Lib
+      Sub.Sub
+  other-modules:
+      Paths_main_aaa_lib
+  hs-source-dirs:
+      src
+  build-depends:
+      base
+    , sub-aaa-lib ==1
+  default-language: Haskell2010

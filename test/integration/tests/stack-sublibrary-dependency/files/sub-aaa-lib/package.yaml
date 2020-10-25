@@ -1,0 +1,14 @@
+name: sub-aaa-lib
+version: 1
+
+dependencies:
+- base
+
+library:
+  source-dirs: src
+
+internal-libraries:
+  inlib:
+    source-dirs: src
+    exposed-modules:
+      - YLib

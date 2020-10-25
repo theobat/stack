@@ -1,0 +1,9 @@
+name: main-aaa-lib
+version: 1
+
+dependencies:
+- base
+- sub-aaa-lib:inlib == 1
+
+library:
+  source-dirs: src

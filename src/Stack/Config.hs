@@ -144,7 +144,9 @@ getSnapshots = do
     logDebug "Done downloading and parsing snapshot versions file"
     return $ getResponseBody result
 
--- | Turn an 'AbstractResolver' into a 'Resolver'.
+-- | Turn an 'AbstractResolver' into a Pantry 'RawSnapshotLocation'.
+-- This is meant to transform snapshot version pointers/abstraction
+-- (such as ARLatestNightly) into a machine usable location.
 makeConcreteResolver
     :: HasConfig env
     => AbstractResolver

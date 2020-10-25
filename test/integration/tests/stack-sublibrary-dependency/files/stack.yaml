@@ -1,0 +1,13 @@
+resolver: ghc-8.6.5
+
+packages:
+  - .
+
+dump-logs: all
+stack-developer-mode: true
+# extra-lib-dirs:
+#   - ./sub-aaa-lib
+
+extra-deps:
+  - ./sub-aaa-lib
+  - Cabal-3.2.0.0@sha256:d0d7a1f405f25d0000f5ddef684838bc264842304fd4e7f80ca92b997b710874,27320
