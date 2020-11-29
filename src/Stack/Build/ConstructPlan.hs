@@ -84,19 +84,26 @@ combineMap = Map.mergeWithKey
     (fmap PIOnlySource)
     (fmap (uncurry PIOnlyInstalled))
 
+-- The result when we try to add a dependency to the 'PlanDraft' using 'addDep'
+-- (whithin the ConstructPlanMonad, see @type ConstructPlanMonad =@).
 data AddDepRes
     = ADRToInstall Task
+    -- ^ the package has never been installed, so do the task.
     | ADRFound InstallLocation Installed
+    -- ^ the package has already been installed, use that thing.
     deriving Show
 
 type ParentMap = MonoidMap PackageName (First Version, [(PackageIdentifier, VersionRange)])
 
+-- | This is a temporary object used to build the final 'Plan' object.
 data PlanDraft = PlanDraft
     { pdFinals :: !(Map PackageName (Either ConstructPlanException Task))
+    -- ^ A mapping of package names and its associated final tasks.
+    -- This is supposed to happen at the end of the execution plan hence the name.
     , pdInstall :: !(Map Text InstallLocation)
-    -- ^ executable to be installed, and location where the binary is placed
+    -- ^ Executable to be installed, and location where the binary is placed.
     , pdDirty :: !(Map PackageName Text)
-    -- ^ why a local package is considered dirty
+    -- ^ Why a local package is considered dirty.
     , pdWarning :: !([Text] -> [Text])
     -- ^ Warnings
     , pdParents :: !ParentMap
@@ -112,19 +119,26 @@ instance Monoid PlanDraft where
 -- collecting an output of type 'PlanDraft' and updating a state of type 
 -- '(Map PackageName (Either ConstructPlanException AddDepRes))' to an inner monad 'IO'.
 -- The R stands for read, W for write and S for state.
-type M = RWST -- TODO replace with more efficient WS stack on top of StackT
+type ConstructPlanMonad = RWST -- TODO replace with more efficient WS stack on top of StackT
     Ctx
     PlanDraft
-    (Map PackageName (Either ConstructPlanException AddDepRes))
+    ConstructPlanState
     IO
+-- | This is the map used as a state (that is, shared) within the
+-- 'ConstructPlanMonad'.
+type ConstructPlanState = Map PackageName (Either ConstructPlanException AddDepRes)
 
 data Ctx = Ctx
     { baseConfigOpts :: !BaseConfigOpts
-    , loadPackage    :: !(PackageLocationImmutable -> Map FlagName Bool -> [Text] -> [Text] -> M Package)
+    , loadPackage    :: !(PackageLocationImmutable -> Map FlagName Bool -> [Text] -> [Text] -> ConstructPlanMonad Package)
     , combinedMap    :: !CombinedMap
     , ctxEnvConfig   :: !EnvConfig
     , callStack      :: ![PackageName]
+    -- ^ This is used to control package dependency cycles (see <./ConstructMap.hs#L450 this file's line>).
+    -- TODO: use a better structure for searching cycles (list search is in O(n)).
+    -- Trouble is, Sets are not ok (we need the sequence in order, even with dupes)
     , wanted         :: !(Set PackageName)
+    -- ^ smtTargets . smTargets of the sourceMap.
     , localNames     :: !(Set PackageName)
     , mcurator       :: !(Maybe Curator)
     , pathEnvVar     :: !Text
@@ -182,30 +196,37 @@ constructPlan baseConfigOpts0 localDumpPkgs loadPackage0 sourceMap installedMap 
     logDebug "Constructing the build plan"
 
     when hasBaseInDeps $
-      prettyWarn $ flow "You are trying to upgrade/downgrade base, which is almost certainly not what you really want. Please, consider using another GHC version if you need a certain version of base, or removing base from extra-deps. See more at https://github.com/commercialhaskell/stack/issues/3940." <> line
+      prettyWarn $ flow (tryingToUpgradeBaseErrorMessage line)
 
     econfig <- view envConfigL
     globalCabalVersion <- view $ compilerPathsL.to cpCabalVersion
     sources <- getSources globalCabalVersion
     mcur <- view $ buildConfigL.to bcCurator
 
-    let onTarget = void . addDep
-    let inner = mapM_ onTarget $ Map.keys (smtTargets $ smTargets sourceMap)
     pathEnvVar' <- liftIO $ maybe mempty T.pack <$> lookupEnv "PATH"
     let ctx = mkCtx econfig globalCabalVersion sources mcur pathEnvVar'
-    ((), m, PlanDraft efinals installExes dirtyReason warnings parents) <-
-        liftIO $ runRWST inner ctx M.empty
+    
+    -- The state of the monad is taking care of the 
+    -- result of addDep, hence the @void@ and the @traverse_@.
+    -- i.e. @M ()@ already has a @Map PackageName (Either ConstructPlanException AddDepRes)@
+    let addTargetTaskToState = void . addDep
+    let innerPackageInitialM :: ConstructPlanMonad ()
+        innerPackageInitialM = traverse_ addTargetTaskToState $ Map.keys (smtTargets $ smTargets sourceMap)
+    ((), addDepPackageMap, planDraftResult) <- liftIO $ runRWST innerPackageInitialM ctx M.empty
+    PlanDraft efinals installExes dirtyReason warnings parents <- planDraftResult
     mapM_ (logWarn . RIO.display) (warnings [])
     let toEither (_, Left e)  = Left e
         toEither (k, Right v) = Right (k, v)
-        (errlibs, adrs) = partitionEithers $ map toEither $ M.toList m
-        (errfinals, finals) = partitionEithers $ map toEither $ M.toList efinals
+        extractErrors = partitionEithers . map toEither . M.toList
+        (errlibs, addDepResult) = extractErrors addDepPackageMap
+        (errfinals, finals) = extractErrors efinals
         errs = errlibs ++ errfinals
     if null errs
         then do
             let toTask (_, ADRFound _ _) = Nothing
                 toTask (name, ADRToInstall task) = Just (name, task)
-                tasks = first libraryPackage $ M.fromList $ mapMaybe toTask adrs
+                -- TODO: make sure these are all libraryPackage :
+                tasks = first libraryPackage $ M.fromList $ mapMaybe toTask addDepResult
                 takeSubset =
                     case boptsCLIBuildSubset $ bcoBuildOptsCLI baseConfigOpts0 of
                         BSAll -> pure
@@ -231,7 +252,11 @@ constructPlan baseConfigOpts0 localDumpPkgs loadPackage0 sourceMap installedMap 
             throwM $ ConstructPlanFailed "Plan construction failed."
   where
     hasBaseInDeps = Map.member (mkPackageName "base") (smDeps sourceMap)
-
+    tryingToUpgradeBaseErrorMessage line = "You are trying to upgrade/downgrade base,\
+        \ which is almost certainly not what you really want.\
+        \ Please, consider using another GHC version if you need a certain version of base,\
+        \ or removing base from extra-deps.\
+        \ See more at https://github.com/commercialhaskell/stack/issues/3940." <> line
     mkCtx econfig globalCabalVersion sources mcur pathEnvVar' = Ctx
         { baseConfigOpts = baseConfigOpts0
         , loadPackage = \w x y z -> runRIO econfig $
@@ -389,7 +414,7 @@ mkUnregisterLocal tasks dirtyReason localDumpPkgs initialBuildSteps =
 -- benchmarks. If @isAllInOne@ is 'True' (the common case), then all of
 -- these should have already been taken care of as part of the build
 -- step.
-addFinal :: LocalPackage -> Package -> Bool -> Bool -> M ()
+addFinal :: LocalPackage -> Package -> Bool -> Bool -> ConstructPlanMonad ()
 addFinal lp package isAllInOne buildHaddocks = do
     depsRes <- addPackageDeps package
     res <- case depsRes of
@@ -430,11 +455,11 @@ addFinal lp package isAllInOne buildHaddocks = do
 -- directly wanted. This makes sense - if we left out packages that are
 -- deps, it would break the --only-dependencies build plan.
 addDep :: PackageName
-       -> M (Either ConstructPlanException AddDepRes)
+       -> ConstructPlanMonad (Either ConstructPlanException AddDepRes)
 addDep name = do
     ctx <- ask
-    m <- get
-    case Map.lookup name m of
+    addDepResMap <- get
+    case Map.lookup name addDepResMap of
         Just res -> do
             planDebug $ "addDep: Using cached result for " ++ show name ++ ": " ++ show res
             return res
@@ -479,7 +504,7 @@ addDep name = do
             return res
 
 -- FIXME what's the purpose of this? Add a Haddock!
-tellExecutables :: PackageName -> PackageSource -> M ()
+tellExecutables :: PackageName -> PackageSource -> ConstructPlanMonad ()
 tellExecutables _name (PSFilePath lp)
     | lpWanted lp = tellExecutablesPackage Local $ lpPackage lp
     | otherwise = return ()
@@ -490,10 +515,10 @@ tellExecutables name (PSRemote pkgloc _version _fromSnaphot cp) =
 
 tellExecutablesUpstream ::
        PackageName
-    -> M (Maybe PackageLocationImmutable)
+    -> ConstructPlanMonad (Maybe PackageLocationImmutable)
     -> InstallLocation
     -> Map FlagName Bool
-    -> M ()
+    -> ConstructPlanMonad ()
 tellExecutablesUpstream name retrievePkgLoc loc flags = do
     ctx <- ask
     when (name `Set.member` wanted ctx) $ do
@@ -502,7 +527,7 @@ tellExecutablesUpstream name retrievePkgLoc loc flags = do
             p <- loadPackage ctx pkgLoc flags [] []
             tellExecutablesPackage loc p
 
-tellExecutablesPackage :: InstallLocation -> Package -> M ()
+tellExecutablesPackage :: InstallLocation -> Package -> ConstructPlanMonad ()
 tellExecutablesPackage loc p = do
     cm <- asks combinedMap
     -- Determine which components are enabled so we know which ones to copy
@@ -529,7 +554,7 @@ tellExecutablesPackage loc p = do
 installPackage :: PackageName
                -> PackageSource
                -> Maybe Installed
-               -> M (Either ConstructPlanException AddDepRes)
+               -> ConstructPlanMonad (Either ConstructPlanException AddDepRes)
 installPackage name ps minstalled = do
     ctx <- ask
     case ps of
@@ -595,7 +620,7 @@ resolveDepsAndInstall :: Bool
                       -> PackageSource
                       -> Package
                       -> Maybe Installed
-                      -> M (Either ConstructPlanException AddDepRes)
+                      -> ConstructPlanMonad (Either ConstructPlanException AddDepRes)
 resolveDepsAndInstall isAllInOne buildHaddocks ps package minstalled = do
     res <- addPackageDeps package
     case res of
@@ -613,7 +638,7 @@ installPackageGivenDeps :: Bool
                         -> ( Set PackageIdentifier
                            , Map PackageIdentifier GhcPkgId
                            , IsMutable )
-                        -> M AddDepRes
+                        -> ConstructPlanMonad AddDepRes
 installPackageGivenDeps isAllInOne buildHaddocks ps package minstalled (missing, present, minMutable) = do
     let name = packageName package
     ctx <- ask
@@ -663,7 +688,7 @@ packageBuildTypeConfig pkg = packageBuildType pkg == Configure
 
 -- Update response in the lib map. If it is an error, and there's
 -- already an error about cyclic dependencies, prefer the cyclic error.
-updateLibMap :: PackageName -> Either ConstructPlanException AddDepRes -> M ()
+updateLibMap :: PackageName -> Either ConstructPlanException AddDepRes -> ConstructPlanMonad ()
 updateLibMap name val = modify $ \mp ->
     case (M.lookup name mp, val) of
         (Just (Left DependencyCycleDetected{}), Left _) -> mp
@@ -684,13 +709,13 @@ addEllipsis t
 -- then the parent package must be installed locally. Otherwise, if it
 -- is 'Snap', then it can either be installed locally or in the
 -- snapshot.
-addPackageDeps :: Package -> M (Either ConstructPlanException (Set PackageIdentifier, Map PackageIdentifier GhcPkgId, IsMutable))
+addPackageDeps :: Package -> ConstructPlanMonad (Either ConstructPlanException (Set PackageIdentifier, Map PackageIdentifier GhcPkgId, IsMutable))
 addPackageDeps package = do
     ctx <- ask
     deps' <- packageDepsWithTools package
     deps <- forM (Map.toList deps') $ \(depname, DepValue range depType) -> do
         eres <- addDep depname
-        let getLatestApplicableVersionAndRev :: M (Maybe (Version, BlobKey))
+        let getLatestApplicableVersionAndRev :: ConstructPlanMonad (Maybe (Version, BlobKey))
             getLatestApplicableVersionAndRev = do
               vsAndRevs <- runRIO ctx $ getHackagePackageVersions YesRequireHackageIndex UsePreferredVersions depname
               pure $ do
@@ -804,7 +829,7 @@ checkDirtiness :: PackageSource
                -> Package
                -> Map PackageIdentifier GhcPkgId
                -> Bool
-               -> M Bool
+               -> ConstructPlanMonad Bool
 checkDirtiness ps installed package present buildHaddocks = do
     ctx <- ask
     moldOpts <- runRIO ctx $ tryGetFlagCache installed
@@ -928,7 +953,7 @@ psLocation PSRemote{} = Snap
 
 -- | Get all of the dependencies for a given package, including build
 -- tool dependencies.
-packageDepsWithTools :: Package -> M (Map PackageName DepValue)
+packageDepsWithTools :: Package -> ConstructPlanMonad (Map PackageName DepValue)
 packageDepsWithTools p = do
     -- Check whether the tool is on the PATH before warning about it.
     warnings <- fmap catMaybes $ forM (Set.toList $ packageUnknownTools p) $
@@ -988,7 +1013,7 @@ stripNonDeps deps plan = plan
       mapM_ (collectMissing (pid:dependents)) (fromMaybe mempty $ M.lookup pid missing)
 
 -- | Is the given package/version combo defined in the snapshot or in the global database?
-inSnapshot :: PackageName -> Version -> M Bool
+inSnapshot :: PackageName -> Version -> ConstructPlanMonad Bool
 inSnapshot name version = do
     ctx <- ask
     return $ fromMaybe False $ do

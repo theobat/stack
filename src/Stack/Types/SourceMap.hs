@@ -88,6 +88,7 @@ isReplacedGlobal (GlobalPackage _) = False
 --
 -- Invariant: a @PackageName@ appears in either 'smwProject' or
 -- 'smwDeps', but not both.
+-- It's generated in module Stack.Config L638 through the function fillProjectWanted.
 data SMWanted = SMWanted
   { smwCompiler :: !WantedCompiler
   , smwProject :: !(Map PackageName ProjectPackage)
@@ -142,7 +143,7 @@ data SourceMap = SourceMap
     -- the packages that get stored in the snapshot database.
   , smDeps :: !(Map PackageName DepPackage)
     -- ^ Need to hash all of the immutable dependencies, can ignore
-    -- the mutable dependencies.
+    -- the mutable dependencies. 
   , smGlobal :: !(Map PackageName GlobalPackage)
     -- ^ Doesn't actually need to be hashed, implicitly captured by
     -- smCompiler. Can be broken if someone installs new global

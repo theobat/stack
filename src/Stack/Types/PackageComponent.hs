@@ -34,3 +34,4 @@ libraryPackage pckName = PackageComponentName {
 -- | Ditch the @componentName :: NamedComponent@ part of a 'PackageComponentName'.
 forgetComponentName :: PackageComponentName -> PackageName
 forgetComponentName = packageName
+
