@@ -11,10 +11,18 @@ Major changes:
 
 Behavior changes:
 
+* `stack repl` now always warns about GHCi problems with loading multiple
+  packages. It also sets now proper working directory when invoked with
+  one package. See
+  [#5421](https://github.com/commercialhaskell/stack/issues/5421)
+
 Other enhancements:
 
 Bug fixes:
 
+* `stack new` now suppports branches other than `master` as default for
+  GitHub repositories. See
+  [#5422](https://github.com/commercialhaskell/stack/issues/5422)
 
 ## v2.5.1
 
