@@ -269,7 +269,7 @@ loadLocalPackage pp = do
         (exeCandidates, testCandidates, benchCandidates) =
             case mtarget of
                 Just (TargetComps comps) -> splitComponents $ Set.toList comps
-                Just (TargetAll _packageType) ->
+                Just (TargetAll _ _) ->
                     ( packageExes pkg
                     , if boptsTests bopts && maybe True (Set.notMember name . curatorSkipTest) mcurator
                         then Map.keysSet (packageTests pkg)

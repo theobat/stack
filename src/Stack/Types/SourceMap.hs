@@ -112,8 +112,10 @@ newtype GlobalPackageVersion = GlobalPackageVersion Version
 
 -- | How a package is intended to be built
 data Target
-  = TargetAll !PackageType
+  = TargetAll !PackageType !(Set NamedComponent)
   -- ^ Build all of the default components.
+  -- We need to explicitely list them, otherwise
+  -- it's potentially unclear what we want to build.
   | TargetComps !(Set NamedComponent)
   -- ^ Only build specific components
 

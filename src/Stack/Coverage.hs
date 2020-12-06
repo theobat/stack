@@ -234,7 +234,7 @@ generateHpcReportForTargets opts tixFiles targetNames = do
              targets <- view $ envConfigL.to envConfigSourceMap.to smTargets.to smtTargets
              liftM concat $ forM (Map.toList targets) $ \(name, target) ->
                  case target of
-                     TargetAll PTDependency -> throwString $
+                     TargetAll PTDependency _ -> throwString $
                          "Error: Expected a local package, but " ++
                          packageNameString name ++
                          " is either an extra-dep or in the snapshot."
@@ -246,7 +246,7 @@ generateHpcReportForTargets opts tixFiles targetNames = do
                                      liftM (pkgPath </>) $ parseRelFile (T.unpack testName ++ "/" ++ T.unpack testName ++ ".tix")
                                  _ -> throwIO $ NonTestSuiteTarget name
                                      
-                     TargetAll PTProject -> do
+                     TargetAll PTProject _ -> do
                          pkgPath <- hpcPkgPath name
                          exists <- doesDirExist pkgPath
                          if exists

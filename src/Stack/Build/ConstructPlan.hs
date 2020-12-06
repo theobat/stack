@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DeriveDataTypeable #-}
@@ -20,6 +21,7 @@ import           Data.List
 import qualified Data.Map.Strict as M
 import qualified Data.Map.Strict as Map
 import           Data.Monoid.Map (MonoidMap(..))
+import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import qualified Distribution.Text as Cabal
@@ -43,7 +45,7 @@ import           Stack.Types.Compiler
 import           Stack.Types.Config
 import           Stack.Types.GhcPkgId
 import           Stack.Types.NamedComponent
-import           Stack.Types.PackageComponent (libraryPackage)
+import           Stack.Types.PackageComponent (PackageComponentName, mkPackageComponent, libraryPackage)
 import           Stack.Types.Package
 import           Stack.Types.SourceMap
 import           Stack.Types.Version
@@ -85,13 +87,18 @@ combineMap = Map.mergeWithKey
     (fmap (uncurry PIOnlyInstalled))
 
 -- The result when we try to add a dependency to the 'PlanDraft' using 'addDep'
--- (whithin the ConstructPlanMonad, see @type ConstructPlanMonad =@).
+-- (whithin the ConstructPlanMonad).
 data AddDepRes
     = ADRToInstall Task
     -- ^ the package has never been installed, so do the task.
     | ADRFound InstallLocation Installed
     -- ^ the package has already been installed, use that thing.
     deriving Show
+
+addDepResToTask :: PackageName -> AddDepRes -> Maybe (PackageName, Task)
+addDepResToTask pName adr = case adr of
+    ADRToInstall t -> Just (pName, t)
+    ADRFound _ _ -> Nothing
 
 type ParentMap = MonoidMap PackageName (First Version, [(PackageIdentifier, VersionRange)])
 
@@ -126,17 +133,15 @@ type ConstructPlanMonad = RWST -- TODO replace with more efficient WS stack on t
     IO
 -- | This is the map used as a state (that is, shared) within the
 -- 'ConstructPlanMonad'.
-type ConstructPlanState = Map PackageName (Either ConstructPlanException AddDepRes)
+type ConstructPlanState = Map PackageComponentName (Either ConstructPlanException AddDepRes)
 
 data Ctx = Ctx
     { baseConfigOpts :: !BaseConfigOpts
     , loadPackage    :: !(PackageLocationImmutable -> Map FlagName Bool -> [Text] -> [Text] -> ConstructPlanMonad Package)
     , combinedMap    :: !CombinedMap
     , ctxEnvConfig   :: !EnvConfig
-    , callStack      :: ![PackageName]
+    , callStack      :: !(Seq PackageComponentName)
     -- ^ This is used to control package dependency cycles (see <./ConstructMap.hs#L450 this file's line>).
-    -- TODO: use a better structure for searching cycles (list search is in O(n)).
-    -- Trouble is, Sets are not ok (we need the sequence in order, even with dupes)
     , wanted         :: !(Set PackageName)
     -- ^ smtTargets . smTargets of the sourceMap.
     , localNames     :: !(Set PackageName)
@@ -196,7 +201,7 @@ constructPlan baseConfigOpts0 localDumpPkgs loadPackage0 sourceMap installedMap 
     logDebug "Constructing the build plan"
 
     when hasBaseInDeps $
-      prettyWarn $ flow (tryingToUpgradeBaseErrorMessage line)
+      prettyWarn $ tryingToUpgradeBaseErrorMessage line
 
     econfig <- view envConfigL
     globalCabalVersion <- view $ compilerPathsL.to cpCabalVersion
@@ -207,13 +212,12 @@ constructPlan baseConfigOpts0 localDumpPkgs loadPackage0 sourceMap installedMap 
     let ctx = mkCtx econfig globalCabalVersion sources mcur pathEnvVar'
     
     -- The state of the monad is taking care of the 
-    -- result of addDep, hence the @void@ and the @traverse_@.
-    -- i.e. @M ()@ already has a @Map PackageName (Either ConstructPlanException AddDepRes)@
-    let addTargetTaskToState = void . addDep
+    -- result of addDep, hence the underscore @traverse_@ (we discard the result).
+    -- i.e. @ConstructPlanMonad ()@ already has a @Map PackageName (Either ConstructPlanException AddDepRes)@
     let innerPackageInitialM :: ConstructPlanMonad ()
-        innerPackageInitialM = traverse_ addTargetTaskToState $ Map.keys (smtTargets $ smTargets sourceMap)
+        innerPackageInitialM = traverse_ addTargetTaskToState $ Map.toList (smtTargets $ smTargets sourceMap)
     ((), addDepPackageMap, planDraftResult) <- liftIO $ runRWST innerPackageInitialM ctx M.empty
-    PlanDraft efinals installExes dirtyReason warnings parents <- planDraftResult
+    let PlanDraft efinals installExes dirtyReason warnings parents = planDraftResult
     mapM_ (logWarn . RIO.display) (warnings [])
     let toEither (_, Left e)  = Left e
         toEither (k, Right v) = Right (k, v)
@@ -223,10 +227,8 @@ constructPlan baseConfigOpts0 localDumpPkgs loadPackage0 sourceMap installedMap 
         errs = errlibs ++ errfinals
     if null errs
         then do
-            let toTask (_, ADRFound _ _) = Nothing
-                toTask (name, ADRToInstall task) = Just (name, task)
-                -- TODO: make sure these are all libraryPackage :
-                tasks = first libraryPackage $ M.fromList $ mapMaybe toTask addDepResult
+            let -- TODO: make sure these are all libraryPackage :
+                tasks = first libraryPackage $ M.fromList $ mapMaybe (uncurry addDepResToTask) addDepResult
                 takeSubset =
                     case boptsCLIBuildSubset $ bcoBuildOptsCLI baseConfigOpts0 of
                         BSAll -> pure
@@ -251,8 +253,9 @@ constructPlan baseConfigOpts0 localDumpPkgs loadPackage0 sourceMap installedMap 
                 pprintExceptions errs stackYaml stackRoot parents (wanted ctx) prunedGlobalDeps
             throwM $ ConstructPlanFailed "Plan construction failed."
   where
+    addTargetTaskToState (!packageName, !target) = addDepComponentSet packageName (targetComponentSet target)
     hasBaseInDeps = Map.member (mkPackageName "base") (smDeps sourceMap)
-    tryingToUpgradeBaseErrorMessage line = "You are trying to upgrade/downgrade base,\
+    tryingToUpgradeBaseErrorMessage line = flow "You are trying to upgrade/downgrade base,\
         \ which is almost certainly not what you really want.\
         \ Please, consider using another GHC version if you need a certain version of base,\
         \ or removing base from extra-deps.\
@@ -263,7 +266,7 @@ constructPlan baseConfigOpts0 localDumpPkgs loadPackage0 sourceMap installedMap 
             applyForceCustomBuild globalCabalVersion <$> loadPackage0 w x y z
         , combinedMap = combineMap sources installedMap
         , ctxEnvConfig = econfig
-        , callStack = []
+        , callStack = mempty
         , wanted = Map.keysSet (smtTargets $ smTargets sourceMap)
         , localNames = Map.keysSet (smProject sourceMap)
         , mcurator = mcur
@@ -444,6 +447,9 @@ addFinal lp package isAllInOne buildHaddocks = do
                 }
     tell mempty { pdFinals = Map.singleton (packageName package) res }
 
+-- | Add a set of components instead of a single one.
+-- Should handle the empty case ()
+addDepComponentSet pName = traverse . addDep pName
 -- | Given a 'PackageName', adds all of the build tasks to build the
 -- package, if needed.
 --
@@ -455,20 +461,22 @@ addFinal lp package isAllInOne buildHaddocks = do
 -- directly wanted. This makes sense - if we left out packages that are
 -- deps, it would break the --only-dependencies build plan.
 addDep :: PackageName
+       -> NamedComponent
        -> ConstructPlanMonad (Either ConstructPlanException AddDepRes)
-addDep name = do
+addDep name componentName = do
     ctx <- ask
     addDepResMap <- get
-    case Map.lookup name addDepResMap of
+    let packageComponent = mkPackageComponent name componentName
+    case Map.lookup packageComponent addDepResMap of
         Just res -> do
             planDebug $ "addDep: Using cached result for " ++ show name ++ ": " ++ show res
             return res
         Nothing -> do
-            res <- if name `elem` callStack ctx
+            res <- if isJust (packageComponent `Seq.elemIndexR` callStack ctx)
                 then do
                     planDebug $ "addDep: Detected cycle " ++ show name ++ ": " ++ show (callStack ctx)
-                    return $ Left $ DependencyCycleDetected $ name : callStack ctx
-                else local (\ctx' -> ctx' { callStack = name : callStack ctx' }) $ do
+                    return $ Left $ DependencyCycleDetected $ toList $ callStack ctx' <> pure name
+                else local (\ctx' -> ctx' { callStack = callStack ctx' <> pure packageComponent }) $ do
                     let mpackageInfo = Map.lookup name $ combinedMap ctx
                     planDebug $ "addDep: Package info for " ++ show name ++ ": " ++ show mpackageInfo
                     case mpackageInfo of
@@ -487,7 +495,7 @@ addDep name = do
                                       -- this could happen for GHC boot libraries missing from Hackage
                                       logWarn $ "No latest package revision found for: " <>
                                           fromString (packageNameString name) <> ", dependency callstack: " <>
-                                          displayShow (map packageNameString $ callStack ctx)
+                                          displayShow (map packageNameString $ toList $ callStack ctx)
                                       return Nothing
                                     Just (_rev, cfKey, treeKey) ->
                                       return . Just $
@@ -527,6 +535,7 @@ tellExecutablesUpstream name retrievePkgLoc loc flags = do
             p <- loadPackage ctx pkgLoc flags [] []
             tellExecutablesPackage loc p
 
+-- | Updates the pdInstall in 'PlanDraft'.
 tellExecutablesPackage :: InstallLocation -> Package -> ConstructPlanMonad ()
 tellExecutablesPackage loc p = do
     cm <- asks combinedMap
@@ -551,7 +560,7 @@ tellExecutablesPackage loc p = do
 
 -- | Given a 'PackageSource' and perhaps an 'Installed' value, adds
 -- build 'Task's for the package and its dependencies.
-installPackage :: PackageName
+installPackage :: PackageComponentName
                -> PackageSource
                -> Maybe Installed
                -> ConstructPlanMonad (Either ConstructPlanException AddDepRes)
@@ -689,11 +698,19 @@ packageBuildTypeConfig pkg = packageBuildType pkg == Configure
 -- Update response in the lib map. If it is an error, and there's
 -- already an error about cyclic dependencies, prefer the cyclic error.
 updateLibMap :: PackageName -> Either ConstructPlanException AddDepRes -> ConstructPlanMonad ()
-updateLibMap name val = modify $ \mp ->
-    case (M.lookup name mp, val) of
-        (Just (Left DependencyCycleDetected{}), Left _) -> mp
-        _ -> M.insert name val mp
+updateLibMap name val = modify depCycleOrInsertPackage
+    where
+        depCycleOrInsertPackage :: ConstructPlanState -> ConstructPlanState
+        depCycleOrInsertPackage mp = case (M.lookup name mp, val) of
+            (Just (Left DependencyCycleDetected{}), Left _) -> mp
+            _ -> M.insert name val mp
 
+-- | Utility to truncate text longer than 100 chars.
+-- TODO: put this in a helper library.
+-- >>> addEllipsis "ok"
+-- "ok"
+-- >>> addEllipsis (replicate 100 "a") == (replicate 97 "a" <> "...")
+-- True
 addEllipsis :: Text -> Text
 addEllipsis t
     | T.length t < 100 = t
@@ -714,7 +731,7 @@ addPackageDeps package = do
     ctx <- ask
     deps' <- packageDepsWithTools package
     deps <- forM (Map.toList deps') $ \(depname, DepValue range depType) -> do
-        eres <- addDep depname
+        eres <- addDep depname mempty
         let getLatestApplicableVersionAndRev :: ConstructPlanMonad (Maybe (Version, BlobKey))
             getLatestApplicableVersionAndRev = do
               vsAndRevs <- runRIO ctx $ getHackagePackageVersions YesRequireHackageIndex UsePreferredVersions depname

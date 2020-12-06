@@ -7,7 +7,7 @@
 module Stack.Types.PackageComponent where
 
 import Stack.Prelude
-import Stack.Types.NamedComponent (NamedComponent(CLib))
+import Stack.Types.NamedComponent (renderPkgComponent, NamedComponent(CLib))
 
 -- | A tuple of a package name and component name (e.g. arrow:lib or stack:exec).
 -- Required for component-addressed build plans.
@@ -18,6 +18,15 @@ data PackageComponentName = PackageComponentName {
   packageName :: !PackageName,
   componentName :: !NamedComponent
 } deriving (Eq, Show, Ord)
+
+mkPackageComponent :: PackageName -> NamedComponent -> PackageComponentName
+mkPackageComponent = PackageComponentName
+
+toTuple :: PackageComponentName -> (PackageName, NamedComponent)
+toTuple pcn = (packageName pcn, componentName pcn)
+
+renderPkgComp :: PackageComponentName -> Text
+renderPkgComp = renderPkgComponent . toTuple
 
 -- | This is needed for computing the largest packageName length in a BuildPlan.
 -- See <../Build/Execute.hs#504 this file>
@@ -35,3 +44,4 @@ libraryPackage pckName = PackageComponentName {
 forgetComponentName :: PackageComponentName -> PackageName
 forgetComponentName = packageName
 
+type ComponentMap a = Map PackageName (Set NamedComponent, a)

@@ -185,7 +185,7 @@ ghci opts@GhciOpts{..} = do
               figureOutMainFile bopts mainIsTargets localTargets pkgs0
     let pkgTargets pn targets =
           case targets of
-            TargetAll _  -> [T.pack (packageNameString pn)]
+            TargetAll{} -> [T.pack (packageNameString pn)]
             TargetComps comps -> [renderPkgComponent (pn, c) | c <- toList comps]
     -- Build required dependencies and setup local packages.
     buildDepsAndInitialSteps opts $
@@ -337,7 +337,7 @@ getAllNonLocalTargets
     :: Map PackageName Target
     -> RIO env [PackageName]
 getAllNonLocalTargets targets = do
-  let isNonLocal (TargetAll PTDependency) = True
+  let isNonLocal (TargetAll PTDependency _) = True
       isNonLocal _ = False
   return $ map fst $ filter (isNonLocal . snd) (M.toList targets)
 
@@ -739,7 +739,7 @@ makeGhciPkgInfo installMap installedMap locals addPkgs mfileTargets pkgDesc = do
 -- (differently).
 wantedPackageComponents :: BuildOpts -> Target -> Package -> Set NamedComponent
 wantedPackageComponents _ (TargetComps cs) _ = cs
-wantedPackageComponents bopts (TargetAll PTProject) pkg = S.fromList $
+wantedPackageComponents bopts (TargetAll PTProject _) pkg = S.fromList $
     (case packageLibraries pkg of
        NoLibraries -> []
        HasLibraries names -> CLib : map CInternalLib (S.toList names)) ++
@@ -947,17 +947,17 @@ getExtraLoadDeps loadAllDeps localMap targets =
 unionTargets :: Ord k => Map k Target -> Map k Target -> Map k Target
 unionTargets = M.unionWith $ \l r ->
     case (l, r) of
-        (TargetAll PTDependency, _) -> r
+        (TargetAll PTDependency _, _) -> r
         (TargetComps sl, TargetComps sr) -> TargetComps (S.union sl sr)
-        (TargetComps _, TargetAll PTProject) -> TargetAll PTProject
+        (TargetComps _, TargetAll PTProject allComponent) -> TargetAll PTProject allComponent
         (TargetComps _, _) -> l
-        (TargetAll PTProject, _) -> TargetAll PTProject
+        (TargetAll PTProject allComponent, _) -> TargetAll PTProject allComponent
 
 hasLocalComp :: (NamedComponent -> Bool) -> Target -> Bool
 hasLocalComp p t =
     case t of
         TargetComps s -> any p (S.toList s)
-        TargetAll PTProject -> True
+        TargetAll PTProject _ -> True
         _ -> False
 
 -- | Run a command and grab the first line of stdout, dropping

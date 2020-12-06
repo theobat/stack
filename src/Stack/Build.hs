@@ -80,7 +80,7 @@ build msetLocalFiles = do
           case Map.lookup pn (smtTargets $ smTargets sourceMap) of
             Nothing ->
               pure Set.empty
-            Just (TargetAll _) ->
+            Just (TargetAll{}) ->
               lpFiles lp
             Just (TargetComps components) ->
               lpFilesForComponents components lp

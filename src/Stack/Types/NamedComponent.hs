@@ -25,6 +25,7 @@ import qualified Data.Text as T
 -- This type is Cabal based, and follows the .cabal files
 -- possibilities.
 -- These options are build targets.
+--
 data NamedComponent
     = CLib
     -- ^ The default library in a haskell project.

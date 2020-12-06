@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE DataKinds          #-}
 {-# LANGUAGE GADTs              #-}
@@ -68,6 +69,7 @@ module Stack.Build.Target
     , parseRawTarget
     , RawTarget (..)
     , UnresolvedComponent (..)
+    , targetComponentSet
     ) where
 
 import           Stack.Prelude
@@ -196,15 +198,29 @@ parseRawTarget t =
 ---------------------------------------------------------------------------------
 -- Resolve the raw targets
 ---------------------------------------------------------------------------------
+-- | Necessary to enable component base Builds. 
+data SingleOrAllComponent
+  = SingleComponent !NamedComponent
+  | AllComponent !(Set NamedComponent)
+  -- ^ Nothing was specified so we infer that we should build possible
+  -- target (including sub-libraries).
+  | AllComponentUnresolved
+  -- ^ This needs to be here for very peculiar cases where we don't know
+  -- how to gather the list of dependencies (TO BE REFINED later).
 
 data ResolveResult = ResolveResult
   { rrName :: !PackageName
   , rrRaw :: !RawInput
-  , rrComponent :: !(Maybe NamedComponent)
+  , rrComponent :: !SingleOrAllComponent
   -- ^ Was a concrete component specified?
+  -- Otherwise explicitely list all the components to build.
+  -- This is part of the Component Based builds initiative.
+  -- Implicit naming is not possible if we want to resolve circular deps & all. 
+  -- (see https://github.com/commercialhaskell/stack/issues/4745)
   , rrAddedDep :: !(Maybe PackageLocationImmutable)
   -- ^ Only if we're adding this as a dependency
   , rrPackageType :: !PackageType
+  -- ^ Is it a dependency or a project package ?
   }
 
 -- | Convert a 'RawTarget' into a 'ResolveResult' (see description on
@@ -242,7 +258,7 @@ resolveRawTarget sma allLocs (ri, rt) =
                 [(name, comp)] -> Right ResolveResult
                   { rrName = name
                   , rrRaw = ri
-                  , rrComponent = Just comp
+                  , rrComponent = SingleComponent comp
                   , rrAddedDep = Nothing
                   , rrPackageType = PTProject
                   }
@@ -262,7 +278,7 @@ resolveRawTarget sma allLocs (ri, rt) =
                         | comp `Set.member` comps -> Right ResolveResult
                             { rrName = name
                             , rrRaw = ri
-                            , rrComponent = Just comp
+                            , rrComponent = SingleComponent comp
                             , rrAddedDep = Nothing
                             , rrPackageType = PTProject
                             }
@@ -283,7 +299,7 @@ resolveRawTarget sma allLocs (ri, rt) =
                             [x] -> Right ResolveResult
                               { rrName = name
                               , rrRaw = ri
-                              , rrComponent = Just x
+                              , rrComponent = SingleComponent x
                               , rrAddedDep = Nothing
                               , rrPackageType = PTProject
                               }
@@ -297,13 +313,15 @@ resolveRawTarget sma allLocs (ri, rt) =
                                 ]
 
     go (RTPackage name)
-      | Map.member name locals = return $ Right ResolveResult
-          { rrName = name
-          , rrRaw = ri
-          , rrComponent = Nothing
-          , rrAddedDep = Nothing
-          , rrPackageType = PTProject
-          }
+      | Just pPackage <- Map.lookup name locals = do
+          allComponent <- ppComponents pPackage
+          return $ Right ResolveResult
+            { rrName = name
+            , rrRaw = ri
+            , rrComponent = AllComponent allComponent
+            , rrAddedDep = Nothing
+            , rrPackageType = PTProject
+            }
       | Map.member name deps =
           pure $ deferToConstructPlan name
       | Just gp <- Map.lookup name globals =
@@ -349,7 +367,7 @@ resolveRawTarget sma allLocs (ri, rt) =
                 Just (_rev, cfKey, treeKey) -> Right ResolveResult
                   { rrName = name
                   , rrRaw = ri
-                  , rrComponent = Nothing
+                  , rrComponent = AllComponentUnresolved
                   , rrAddedDep = Just $ PLIHackage (PackageIdentifier name version) cfKey treeKey
                   , rrPackageType = PTDependency
                   }
@@ -362,7 +380,7 @@ resolveRawTarget sma allLocs (ri, rt) =
             Right ResolveResult
                   { rrName = name
                   , rrRaw = ri
-                  , rrComponent = Nothing
+                  , rrComponent = AllComponentUnresolved
                   , rrAddedDep = Just loc
                   , rrPackageType = PTDependency
                   }
@@ -374,7 +392,7 @@ resolveRawTarget sma allLocs (ri, rt) =
           Just (_rev, cfKey, treeKey) -> Right ResolveResult
             { rrName = name
             , rrRaw = ri
-            , rrComponent = Nothing
+            , rrComponent = AllComponentUnresolved
             , rrAddedDep = Just $ PLIHackage (PackageIdentifier name version) cfKey treeKey
             , rrPackageType = PTDependency
             }
@@ -388,7 +406,7 @@ resolveRawTarget sma allLocs (ri, rt) =
     deferToConstructPlan name = Right ResolveResult
               { rrName = name
               , rrRaw = ri
-              , rrComponent = Nothing
+              , rrComponent = AllComponentUnresolved
               , rrAddedDep = Nothing
               , rrPackageType = PTDependency
               }
@@ -406,26 +424,29 @@ combineResolveResults results = do
         Nothing -> return Map.empty
         Just pl -> do
           return $ Map.singleton (rrName result) pl
-
-    let m0 = Map.unionsWith (++) $ map (\rr -> Map.singleton (rrName rr) [rr]) results
-        (errs, ms) = partitionEithers $ flip map (Map.toList m0) $ \(name, rrs) ->
-            let mcomps = map rrComponent rrs in
-            -- Confirm that there is either exactly 1 with no component, or
-            -- that all rrs are components
-            case rrs of
-                [] -> assert False $ Left "Somehow got no rrComponent values, that can't happen"
-                [rr] | isNothing (rrComponent rr) -> Right $ Map.singleton name $ TargetAll $ rrPackageType rr
-                _
-                  | all isJust mcomps -> Right $ Map.singleton name $ TargetComps $ Set.fromList $ catMaybes mcomps
-                  | otherwise -> Left $ T.concat
-                      [ "The package "
-                      , T.pack $ packageNameString name
-                      , " was specified in multiple, incompatible ways: "
-                      , T.unwords $ map (unRawInput . rrRaw) rrs
-                      ]
-
-    return (errs, Map.unions ms, addedDeps)
-
+    let (!errs, !mappingRes) = foldl' handleResolveResult ([], mempty) results
+    return (errs, mappingRes, addedDeps)
+  where
+    -- | Either all rrs for a given package name have a component (first case),
+    -- or there's only one with no component (second case).
+    handleResolveResult (!errList, !mapping) !rr = case (rrComponent rr, Map.lookup compName mapping) of
+      (SingleComponent namedComp, lookupVal) -> case lookupVal of
+        Just (TargetComps !eSet) -> baseResult $ makeTarget eSet -- already exists then combine their components
+        Nothing -> baseResult $ makeTarget mempty -- doesnt exist then create it
+        _ -> errorCase
+        where makeTarget prevSet = TargetComps $ Set.insert namedComp prevSet
+      (AllComponent componentSet, Nothing) -> baseResult $ TargetAll (rrPackageType rr) componentSet
+      _ -> errorCase
+      where
+        baseResult targetVal = (errList, Map.insert compName targetVal mapping)
+        compName = rrName rr
+        errorCase = (errList <> [T.concat
+                  [ "The package "
+                  , T.pack $ packageNameString compName
+                  , " was specified in multiple, incompatible ways: "
+                  , (unRawInput . rrRaw) rr
+                  ]], mapping)
+    
 ---------------------------------------------------------------------------------
 -- OK, let's do it!
 ---------------------------------------------------------------------------------
@@ -480,3 +501,9 @@ parseTargets needTargets haddockDeps boptscli smActual = do
         PCProject _ -> False
         PCGlobalProject -> True
         PCNoProject _ -> False
+
+-- | Gather the target's components.
+targetComponentSet :: Target -> Set NamedComponent
+targetComponentSet targetValue = case targetValue of
+  TargetAll _ setComp -> setComp
+  TargetComps setComp -> setComp
