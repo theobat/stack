@@ -36,6 +36,7 @@ import Distribution.System (OS (..), Platform (..))
 import Stack.Constants (relDirBuild)
 import Stack.Constants.Config (distDirFromDir)
 
+-- | A precompiled task only exists for remote packages, never for local packages.
 getPrecompiled :: HasEnvConfig env =>
     TaskType
     -> BaseConfigOpts
